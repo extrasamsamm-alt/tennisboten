@@ -1,0 +1,4 @@
+signaler.html
+__pycache__/
+*.pyc
+data/paper/bets.jsonl.tmp
