@@ -15,6 +15,7 @@ jobs:
     env:
       TZ: Europe/Stockholm
       TML_ALLTID_HAMTA: "1"
+      ODDSPAPI_KEY: ${{ secrets.ODDSPAPI_KEY }}   # Settings → Secrets and variables → Actions
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -30,7 +31,7 @@ jobs:
           cp signaler.html docs/index.html
           git config user.name "tennisboten"
           git config user.email "tennisboten@users.noreply.github.com"
-          git add docs/index.html data/paper
+          git add docs/index.html data/paper data/odds
           git diff --cached --quiet || git commit -m "Boten: uppdatering $(date '+%Y-%m-%d %H:%M')"
           git pull --rebase --autostash || true
           git push

@@ -2,3 +2,4 @@ signaler.html
 __pycache__/
 *.pyc
 data/paper/bets.jsonl.tmp
+data/odds/cache.json.tmp

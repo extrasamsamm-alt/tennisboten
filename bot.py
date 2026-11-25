@@ -7,14 +7,18 @@ Kommandon (kör i mappen polymarket-tennis):
   python3 bot.py uppslag https://polymarket.com/event/<slug>  samma sak med Polymarket-länk
   python3 bot.py rapport          hur det gått hittills
 
-Strategin (vald i strategi.py, provad på data den aldrig sett):
+Två strategier låtsasspelas sida vid sida så att de kan jämföras:
+  * "pinnacle" (huvudstrategin): Pinnacles odds utan marginal = rättvis chans.
+    Edge = rättvis chans - vårt budpris, minst 3 procentenheter. Statistikmodellen
+    används bara som filter: den får inte tycka att spelaren är sämre än budpriset.
+    Kräver ODDSPAPI_KEY (se odds.py).
+  * "modell" (den gamla): statistikmodellens chans - budpris, minst 10 procentenheter.
+    Behålls bara som jämförelse. Kör validera.py för att se om modellen alls slår marknaden.
   * ATP-touren inkl. Grand Slam, ej kval (TML saknar kval och Challenger).
-  * Modellen räknar vinstchans ur statistik (Elo per underlag, ranking, serve/retur,
-    form, belastning, vila, inbördes möten). Spelare väljs bara på edge: favorit
-    eller underdog spelar ingen roll.
-  * Edge = modellens chans - budpris, måste vara över 10 procentenheter.
   * Köpbud 1 cent under mittpriset, cirka 3 timmar före start. Ingen avgift för bud.
   * Låtsasinsats: fast 100 kr, och parallellt kvarts-Kelly (max 3 %) av 10 000 kr.
+  * Bud som inte fylls rättas ändå, så att rapporten visar om fyllda bud är sämre
+    än ofyllda (fylls bara när priset går emot oss = snedvridning).
 Inga riktiga order, ingen nyckel, ingen wallet. Bara publik data.
 """
 import csv, json, math, os, sys, time, urllib.parse, urllib.request
@@ -22,10 +26,11 @@ from datetime import datetime, timezone
 import numpy as np
 from sklearn.linear_model import LogisticRegression
 import hamta_historik as h
+import odds
 import tml
 from modell_val import vec, rows
 
-STRAT = {"edge": 0.10, "fore_h": 3.0, "fonster_h": 0.75, "bud_under": 0.01, "min_salt": 15,
+STRAT = {"edge": 0.10, "edge_pin": 0.03, "modell_filter": 0.0, "fore_h": 3.0, "fonster_h": 0.75, "bud_under": 0.01, "min_salt": 15,
          "kassa": 10000.0, "fast": 100.0, "kelly": 0.25, "kelly_max": 0.03}
 PAPER = "data/paper/bets.jsonl"
 DATA = "https://data-api.polymarket.com/v2/trades"
@@ -188,14 +193,18 @@ def analyse(model, e, m, st):
         out["skäl"] = ctx; return out
     out.update({"A": A, "B": B, "q": q, "ctx": ctx, "level": tinfo["level"]})
     names = out["outcomes"]
-    # Polymarkets utfall kan stå i annan ordning eller med kortare namn än titeln
-    idxA = 0 if tml.short(names[0]) == tml.short(A) or tml.norm(names[0]) in tml.norm(A) else 1
+    # Polymarkets utfall kan stå i annan ordning eller med kortare namn än titeln.
+    # Kräv att exakt ett utfall är A och det andra B, annars ingen bedömning.
+    idxA = outcome_index(names, A, B)
+    if idxA is None:
+        out["skäl"] = f"kunde inte koppla utfallen {names} till {A} / {B}"; return out
     sides = []
     for i, tok in enumerate(out["tokens"]):
         bids, asks, tick = book(tok)
         qi = q if i == idxA else 1 - q
         s = {"spelare": names[i], "chans": qi, "bästa_bud": bids[0][0] if bids else None,
              "bästa_sälj": asks[0][0] if asks else None, "djup_sälj": asks[:3], "djup_köp": bids[:3]}
+        s["är_A"] = i == idxA
         if bids and asks:
             mid = (bids[0][0] + asks[0][0]) / 2
             bid = math.floor((mid - STRAT["bud_under"]) / tick + 1e-9) * tick
@@ -205,17 +214,61 @@ def analyse(model, e, m, st):
                       "edge_om_köp": qi - (asks[0][0] + out["fee_rate"] * asks[0][0] * (1 - asks[0][0]))})
         sides.append(s)
     out["sides"] = sides
-    cand = [s for s in sides if s.get("edge") is not None and s["edge"] > STRAT["edge"] and s["budpris"] >= 0.02]
-    if cand:
-        s = max(cand, key=lambda s: s["edge"])
-        out["signal"] = s["spelare"]
-        out["slutsats"] = (f"Lägg köpbud på {s['spelare']} på {s['budpris']:.2f} (spela upp till {s['maxpris']:.2f}). "
-                           f"Modellen: {100 * s['chans']:.0f} % chans, edge {100 * s['edge']:.1f} procentenheter.")
-    else:
-        out["slutsats"] = "Inget spelvärde: ingen spelare har över 10 procentenheters edge."
     if "50-50" in out["regler"] and "walkover" in out["regler"].lower():
         out["flagga"] = "Walkover ger 50-50 på Polymarket (många bookmakers makulerar i stället)."
+    decide(out)
     return out
+
+
+def outcome_index(names, A, B):
+    """Vilket av Polymarkets två utfall är spelare A? None om det inte är entydigt."""
+    if len(names) != 2:
+        return None
+    for i in (0, 1):
+        if odds.same_player(names[i], A) and odds.same_player(names[1 - i], B) \
+                and not (odds.same_player(names[i], B) and odds.same_player(names[1 - i], A)):
+            return i
+    return None
+
+
+def add_pin(a, pin):
+    """Hämtar Pinnacles rättvisa chans och lägger den på varje sida. Kostar ett anrop."""
+    if "sides" not in a:
+        return
+    p, why = pin.fair(a["A"], a["B"], a["start"])
+    if not p:
+        a["pin_skäl"] = why; return
+    a["pin"] = p
+    for s in a["sides"]:
+        s["pin"] = p["pA"] if s["är_A"] else p["pB"]
+        if s.get("budpris") is not None:
+            s["edge_pin"] = s["pin"] - s["budpris"]
+            s["maxpris_pin"] = round(s["pin"] - STRAT["edge_pin"], 3)
+
+
+def decide(a):
+    """Sätter signal (Pinnacle-strategin) och signal_modell (gamla strategin)."""
+    a.pop("signal", None); a.pop("signal_modell", None)
+    ok = [s for s in a.get("sides", []) if s.get("budpris") is not None and s["budpris"] >= 0.02]
+    pin = [s for s in ok if s.get("edge_pin") is not None and s["edge_pin"] >= STRAT["edge_pin"]
+           and s["chans"] - s["budpris"] >= STRAT["modell_filter"]]
+    mod = [s for s in ok if s["edge"] > STRAT["edge"]]
+    if pin:
+        s = max(pin, key=lambda s: s["edge_pin"])
+        a["signal"] = s["spelare"]
+        a["slutsats"] = (f"Lägg köpbud på {s['spelare']} på {s['budpris']:.2f} (högst {s['maxpris_pin']:.2f}). "
+                         f"Pinnacle: {100 * s['pin']:.0f} % rättvis chans, edge {100 * s['edge_pin']:.1f} procentenheter; "
+                         f"modellen {100 * s['chans']:.0f} %.")
+    elif a.get("pin"):
+        a["slutsats"] = (f"Inget spelvärde: Polymarket ligger inom {100 * STRAT['edge_pin']:.0f} procentenheter från Pinnacle"
+                         " (eller så säger modellen emot).")
+    else:
+        a["slutsats"] = "Ingen Pinnacle-jämförelse " + (f"({a['pin_skäl']})" if a.get("pin_skäl") else
+                                                           "(hämtas bara ca 3 timmar före start)") + "."
+    if mod:
+        s = max(mod, key=lambda s: s["edge"])
+        a["signal_modell"] = s["spelare"]
+        a["slutsats"] += f" Gamla modellstrategin: {s['spelare']} (edge {100 * s['edge']:.1f}), bara låtsas."
 
 
 # ---------- paper trading ----------
@@ -234,23 +287,31 @@ def save_bets(bs):
     os.replace(tmp, PAPER)
 
 
-def kassa_nu(bs, key):
+def strat_of(b):
+    return b.get("strategi", "modell")   # bet från före Pinnacle tillhör den gamla strategin
+
+
+def kassa_nu(bs, key, strategi="pinnacle"):
     k = STRAT["kassa"]
     for b in bs:
-        if b.get("status") == "avgjord":
+        if b.get("status") == "avgjord" and strat_of(b) == strategi:
             k += b[f"resultat_{key}"]
     return k
 
 
-def place(a, bs):
-    s = next(x for x in a["sides"] if x["spelare"] == a["signal"])
-    kelly = max(0.0, min(STRAT["kelly"] * (s["chans"] - s["budpris"]) / (1 - s["budpris"]), STRAT["kelly_max"]))
-    b = {"lagd": int(NOW()), "slug": a["slug"], "title": a["title"], "start": a["start"], "conditionId": a["conditionId"],
+def place(a, bs, strategi="pinnacle"):
+    who = a["signal"] if strategi == "pinnacle" else a["signal_modell"]
+    s = next(x for x in a["sides"] if x["spelare"] == who)
+    p = s["pin"] if strategi == "pinnacle" else s["chans"]
+    kelly = max(0.0, min(STRAT["kelly"] * (p - s["budpris"]) / (1 - s["budpris"]), STRAT["kelly_max"]))
+    b = {"lagd": int(NOW()), "strategi": strategi, "slug": a["slug"], "title": a["title"], "start": a["start"], "conditionId": a["conditionId"],
          "spelare": s["spelare"], "token": a["tokens"][a["outcomes"].index(s["spelare"])],
          "utfall_index": a["outcomes"].index(s["spelare"]), "budpris": s["budpris"], "chans": round(s["chans"], 4),
-         "edge": round(s["edge"], 4), "mitt": s["mitt"], "spread": s["spread"], "djup_sälj": s["djup_sälj"],
+         "edge": round(s["edge"], 4), "pin": None if s.get("pin") is None else round(s["pin"], 4),
+         "edge_pin": None if s.get("edge_pin") is None else round(s["edge_pin"], 4),
+         "pin_odds": a.get("pin") and [a["pin"]["oddsA"], a["pin"]["oddsB"]], "mitt": s["mitt"], "spread": s["spread"], "djup_sälj": s["djup_sälj"],
          "volym": a["volume"], "nivå": a["level"], "kontext": a["ctx"], "insats_fast": STRAT["fast"],
-         "insats_kelly": round(kelly * kassa_nu(bs, "kelly"), 2), "status": "väntar på start"}
+         "insats_kelly": round(kelly * kassa_nu(bs, "kelly", strategi), 2), "status": "väntar på start"}
     bs.append(b)
     return b
 
@@ -284,16 +345,24 @@ def settle(bs):
                 b["pris_vid_start"] = None
             b["status"] = "väntar på resultat" if b["fylld"] else "ej fylld"
             changed += 1
-        if b["status"] == "väntar på resultat":
-            e = h.get(f"{h.GAMMA}/events/slug/{b['slug']}")
+        # Rätta både fyllda och ofyllda bud. Ofyllda får "resultat_om_fylld" så att
+        # rapporten kan visa om de bud som fylls är sämre än de som inte fylls.
+        unfilled_open = b["status"] == "ej fylld" and "utfall" not in b and NOW() < b["start"] + 14 * 86400
+        if b["status"] == "väntar på resultat" or unfilled_open:
+            try:
+                e = h.get(f"{h.GAMMA}/events/slug/{b['slug']}")
+            except Exception as err:
+                print("Kunde inte rätta", b["slug"], err); continue
             m = next((x for x in e.get("markets", []) if x["conditionId"] == b["conditionId"]), None)
             if m and m.get("closed"):
                 r = float(json.loads(m["outcomePrices"])[b["utfall_index"]])
                 b["utfall"] = r
                 for key in ("fast", "kelly"):
                     st = b[f"insats_{key}"]
-                    b[f"resultat_{key}"] = round(st / b["budpris"] * r - st, 2)
-                b["status"] = "avgjord"
+                    res = round(st / b["budpris"] * r - st, 2)
+                    b[f"resultat_{key}" if b["status"] != "ej fylld" else f"resultat_om_fylld_{key}"] = res
+                if b["status"] != "ej fylld":
+                    b["status"] = "avgjord"
                 changed += 1
     return changed
 
@@ -314,6 +383,15 @@ def show(a):
         c = a["ctx"][nm]
         print(f"  {nm:<28} rank {c['ranking']}, Elo {c['elo']} ({a['ctx']['underlag']}: {c['elo_underlag']}), form10 {c['form10']}, "
               f"serve {c['serve_vunna']}, retur {c['retur_vunna']}, matcher 14d {c['matcher_14d']}, vila {c['vila_dagar']} d")
+    if a.get("pin"):
+        p = a["pin"]
+        print(f"  PINNACLE: {a['A']} {p['oddsA']:.2f} ({100 * p['pA']:.1f} %), {a['B']} {p['oddsB']:.2f} ({100 * p['pB']:.1f} %), "
+              f"marginal {100 * p['marginal']:.1f} %, {p['ålder_min']} min gammalt")
+        for s in a["sides"]:
+            if s.get("edge_pin") is not None:
+                print(f"  {s['spelare']:<28} edge mot Pinnacle med vårt bud: {100 * s['edge_pin']:+5.1f}")
+    elif a.get("pin_skäl"):
+        print("  Pinnacle:", a["pin_skäl"])
     print(f"  inbördes: {a['ctx']['inbördes']} | volym {a['volume']:,.0f} USD")
     if a.get("flagga"):
         print("  OBS:", a["flagga"])
@@ -326,6 +404,38 @@ def html(analyses, bs):
 
 
 def report(bs):
+    for strategi in ("pinnacle", "modell"):
+        g = [b for b in bs if strat_of(b) == strategi]
+        print(f"\n===== Strategi: {strategi} =====")
+        report_one(g, strategi)
+        selection(g)
+
+
+def selection(bs):
+    """Snedvridning: är budet som fylls sämre än budet som inte fylls?
+
+    Ett köpbud under mittpriset fylls oftast när någon säljer till oss, alltså när
+    priset rör sig mot oss. Jämför faktiska vinster med väntade i båda grupperna."""
+    f = [b for b in bs if b["status"] == "avgjord" and b.get("utfall") in (0, 1)]
+    u = [b for b in bs if b["status"] == "ej fylld" and b.get("utfall") in (0, 1)]
+    if not f and not u:
+        return
+    print("  Fyllda mot ofyllda bud (väntat = budets chans enligt strategins sannolikhet):")
+    for label, g in (("fyllda", f), ("ofyllda", u)):
+        if not g:
+            print(f"    {label:<8} inga rättade än"); continue
+        p = lambda b: b["pin"] if strat_of(b) == "pinnacle" and b.get("pin") is not None else b["chans"]
+        won, exp = sum(b["utfall"] for b in g), sum(p(b) for b in g)
+        key = "resultat_fast" if label == "fyllda" else "resultat_om_fylld_fast"
+        roi = sum(b.get(key, 0) for b in g) / sum(b["insats_fast"] for b in g)
+        clv = [b["pris_vid_start"] - b["budpris"] for b in g if b.get("pris_vid_start") is not None]
+        clvt = f", pris vid start {100 * sum(clv) / len(clv):+.1f} öre mot budet" if clv else ""
+        print(f"    {label:<8} {len(g):>3} st: vann {won:.0f}, väntat {exp:.1f}, ROI {100 * roi:+.1f} %{clvt}")
+    if f and u:
+        print("    Är ofyllda klart bättre än fyllda gör budstrategin att du systematiskt får de sämre betten.")
+
+
+def report_one(bs, strategi):
     done = [b for b in bs if b["status"] == "avgjord"]
     print(f"Låtsasbet: {len(bs)} lagda, {sum(b['status'] == 'ej fylld' for b in bs)} ej fyllda, "
           f"{sum(b['status'].startswith('väntar') for b in bs)} väntar, {len(done)} avgjorda")
@@ -336,14 +446,17 @@ def report(bs):
         print("Inga avgjorda bet än."); return
     for key in ("fast", "kelly"):
         st = sum(b[f"insats_{key}"] for b in done); pnl = sum(b[f"resultat_{key}"] for b in done)
-        print(f"  {key:<5}: insats {st:,.0f} kr, resultat {pnl:+,.0f} kr, ROI {100 * pnl / st if st else 0:+.1f} %, kassa {kassa_nu(bs, key):,.0f} kr")
-    print(f"  vann {sum(b['utfall'] == 1 for b in done)} av {len(done)}, modellen väntade sig "
-          f"{sum(b['chans'] for b in done):.1f} vinster, snittbud {sum(b['budpris'] for b in done) / len(done):.2f}")
+        print(f"  {key:<5}: insats {st:,.0f} kr, resultat {pnl:+,.0f} kr, ROI {100 * pnl / st if st else 0:+.1f} %, kassa {kassa_nu(bs, key, strategi):,.0f} kr")
+    pv = lambda b: b["pin"] if strategi == "pinnacle" and b.get("pin") is not None else b["chans"]
+    print(f"  vann {sum(b['utfall'] == 1 for b in done)} av {len(done)}, strategins sannolikhet väntade sig "
+          f"{sum(pv(b) for b in done):.1f} vinster, snittbud {sum(b['budpris'] for b in done) / len(done):.2f}")
     clv = [b["pris_vid_start"] - b["mitt"] for b in done if b.get("pris_vid_start") is not None]
     if clv:
         print(f"  priset rörde sig i snitt {100 * sum(clv) / len(clv):+.1f} öre mot oss fram till start (plus = marknaden höll med modellen)")
-    for lo, hi in ((0.10, 0.15), (0.15, 0.25), (0.25, 1)):
-        g = [b for b in done if lo <= b["edge"] < hi]
+    ek = "edge_pin" if strategi == "pinnacle" else "edge"
+    steps = ((0.03, 0.05), (0.05, 0.08), (0.08, 1)) if strategi == "pinnacle" else ((0.10, 0.15), (0.15, 0.25), (0.25, 1))
+    for lo, hi in steps:
+        g = [b for b in done if b.get(ek) is not None and lo <= b[ek] < hi]
         if g:
             pnl = sum(b["resultat_fast"] for b in g); st = sum(b["insats_fast"] for b in g)
             print(f"  edge {int(lo * 100)}-{int(hi * 100)}: {len(g)} bet, ROI {100 * pnl / st:+.1f} %")
@@ -355,19 +468,33 @@ def run_once():
     model = Model()
     bs = load_bets()
     n_settled = settle(bs)
-    done = {b["slug"] for b in bs}
+    done = {(b["slug"], strat_of(b)) for b in bs}
+    pin = odds.Pinnacle()
     analyses, new = [], 0
     for e, m, st in upcoming():
         try:
-            a = analyse(model, e, m, st)
+            analyses.append(analyse(model, e, m, st))
         except Exception as err:
-            print("FEL", e.get("slug"), err); continue
-        analyses.append(a)
-        to_start = (st - NOW()) / 3600
-        if (a.get("signal") and a["slug"] not in done
-                and STRAT["fore_h"] - STRAT["fonster_h"] <= to_start <= STRAT["fore_h"] + STRAT["fonster_h"]):
-            b = place(a, bs); new += 1
-            print(f"NYTT LÅTSASBET: {b['title']} -> {b['spelare']} bud {b['budpris']:.2f}, edge {100 * b['edge']:.1f}")
+            print("FEL", e.get("slug"), err)
+    in_window = lambda a: STRAT["fore_h"] - STRAT["fonster_h"] <= (a["start"] - NOW()) / 3600 <= STRAT["fore_h"] + STRAT["fonster_h"]
+    # Pinnacle-anropen är få (gratisnivån): bara matcher i spelfönstret som inte redan
+    # har ett Pinnacle-bet, lägst Polymarket-volym först (där priserna oftast är skeva).
+    todo = sorted((a for a in analyses if "sides" in a and in_window(a) and (a["slug"], "pinnacle") not in done),
+                  key=lambda a: a.get("volume") or 0)
+    for a in todo:
+        add_pin(a, pin); decide(a)
+    for a in analyses:
+        if not in_window(a):
+            continue
+        for strategi, key in (("pinnacle", "signal"), ("modell", "signal_modell")):
+            if a.get(key) and (a["slug"], strategi) not in done:
+                b = place(a, bs, strategi); new += 1; done.add((a["slug"], strategi))
+                e_ = b["edge_pin"] if strategi == "pinnacle" else b["edge"]
+                print(f"NYTT LÅTSASBET ({strategi}): {b['title']} -> {b['spelare']} bud {b['budpris']:.2f}, edge {100 * e_:.1f}")
+    if pin.active():
+        print(f"Pinnacle-anrop kvar idag/månad: {pin.left()}")
+    else:
+        print("Pinnacle av: sätt ODDSPAPI_KEY för huvudstrategin (se odds.py).")
     save_bets(bs)
     html(analyses, bs)
     sig = [a for a in analyses if a.get("signal")]
@@ -385,16 +512,15 @@ def lookup(args):
         m = next((x for x in e.get("markets", []) if x.get("sportsMarketType") == "moneyline"), None)
         if not m:
             print("Ingen matchvinnarmarknad i den länken."); return
-        show(analyse(model, e, m, h.ts(m["gameStartTime"]))); return
+        a = analyse(model, e, m, h.ts(m["gameStartTime"])); add_pin(a, odds.Pinnacle()); decide(a); show(a); return
     if len(args) != 2:
         print('Ange två spelare: python3 bot.py uppslag "Spelare A" "Spelare B"'); return
     want = {tml.short(args[0]), tml.short(args[1])}
     for e, m, st in upcoming(hours=24 * 14):
         names = (e.get("title") or "").split(": ", 1)[-1].split(" vs ")
         if len(names) == 2 and {tml.short(n) for n in names} == want:
-            show(analyse(model, e, m, st)); return
+            a = analyse(model, e, m, st); add_pin(a, odds.Pinnacle()); decide(a); show(a); return
     print("Matchen finns inte bland Polymarkets kommande ATP-matcher (två veckor framåt). Ingen bedömning görs.")
-    tinfo = None
 
 
 def main():

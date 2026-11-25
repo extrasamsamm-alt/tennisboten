@@ -2,7 +2,7 @@
 import html as H
 from datetime import datetime
 
-RIKTIG_INSATS_USD = 10   # förslag på riktig insats per bet medan strategin testas (1 % av 1 000 $)
+RIKTIG_INSATS_USD = 10   # används bara för att räkna antal andelar i instruktionen; inga riktiga pengar förrän strategin är bevisad
 
 
 def tid(ts):
@@ -95,14 +95,14 @@ def signal_card(a):
     return f"""<div class="card">
 <div class="top"><span>{H.escape(a['title'])}</span><span>Start {tid(a['start'])}</span></div>
 <div class="pick">Köp {H.escape(s['spelare'])}</div>
-<span class="edge">Edge {100 * s['edge']:.0f} procentenheter</span>
-<div class="bars">{bar('Botens chans', s['chans'], 'bot')}{bar('Polymarket', s['mitt'], 'pm')}</div>
-<div class="cols"><div><b>Varför boten tror det</b><ul>{reasons}</ul></div>
+<span class="edge">Edge {100 * s['edge_pin']:.1f} procentenheter mot Pinnacle</span>
+<div class="bars">{bar('Pinnacle (rättvis)', s['pin'], 'bot')}{bar('Polymarket', s['mitt'], 'pm')}{bar('Statistikmodellen', s['chans'], 'pm')}</div>
+<div class="cols"><div><b>Varför</b><ul><li>Pinnacles odds {a['pin']['oddsA' if s['är_A'] else 'oddsB']:.2f} utan marginal ger {pct(s['pin'], 1)}, Polymarket-budet är {100 * bud:.0f}¢</li>{reasons}</ul></div>
 <div class="how"><b>Så lägger du budet</b><br>Polymarket → {H.escape(s['spelare'])} → <b>Buy</b> → <b>Limit</b><br>
-Limit price: <b>{100 * bud:.0f}¢</b> &nbsp;(högst {100 * s['maxpris']:.0f}¢, klicka aldrig vanligt köp)<br>
+Limit price: <b>{100 * bud:.0f}¢</b> &nbsp;(högst {100 * s['maxpris_pin']:.0f}¢, klicka aldrig vanligt köp)<br>
 Shares: <b>{andelar}</b> → kostar ca <b>{andelar * bud:.2f} $</b>, ger <b>{andelar} $</b> tillbaka om {H.escape(s['spelare'].split()[-1])} vinner<br>
 <span class="mut">Fylls budet inte före start försvinner det. Det är okej.</span></div></div>{flag}
-<div class="mut" style="margin-top:10px;font-size:13px">Motståndaren {H.escape(other['spelare'])}: botens chans {pct(other['chans'])}, Polymarket {pct(other.get('mitt') or 0)}.</div>
+<div class="mut" style="margin-top:10px;font-size:13px">Motståndaren {H.escape(other['spelare'])}: Pinnacle {pct(other['pin'])}, modellen {pct(other['chans'])}, Polymarket {pct(other.get('mitt') or 0)}.</div>
 </div>"""
 
 
@@ -138,6 +138,8 @@ def status_pill(b):
 
 
 def build(analyses, bs, strat, kassa_fn):
+    alla = bs
+    bs = [b for b in alla if b.get("strategi", "modell") == "pinnacle"]   # rutorna och kurvan = huvudstrategin
     done = [b for b in bs if b.get("status") == "avgjord"]
     insats = sum(b["insats_fast"] for b in done); res = sum(b["resultat_fast"] for b in done)
     vann = sum(1 for b in done if b.get("utfall") == 1)
@@ -149,16 +151,18 @@ def build(analyses, bs, strat, kassa_fn):
     sig = sorted((a for a in analyses if a.get("signal")), key=lambda a: a["start"])
     cards = "".join(signal_card(a) for a in sig) or (
         '<div class="card empty"><div class="big">Inget spelvärde just nu</div>'
-        '<div class="mut">Boten hittar ingen ATP-match där edgen är minst 10 procentenheter. Det är vanligt; vänta in nästa.</div></div>')
+        f'<div class="mut">Ingen ATP-match där Polymarket-budet är minst {100 * strat["edge_pin"]:.0f} procentenheter under Pinnacles rättvisa chans. Det är vanligt; vänta in nästa.</div></div>')
     def logrow(b):
         res_txt = f"{b['resultat_fast']:+.0f} kr" if b.get("status") == "avgjord" else ""
+        if b.get("status") == "ej fylld" and b.get("resultat_om_fylld_fast") is not None:
+            res_txt = f"<span class='mut'>({b['resultat_om_fylld_fast']:+.0f})</span>"
         return (f"<tr><td>{tid(b['start'])}</td><td><b>{H.escape(b['spelare'])}</b>"
-                f"<span class='sub'>{H.escape(b['title'].split(': ', 1)[-1])}</span></td>"
+                f"<span class='sub'>{H.escape(b['title'].split(': ', 1)[-1])} · {b.get('strategi', 'modell')}</span></td>"
                 f"<td class='r'>{100 * b['budpris']:.0f}¢</td><td class='r hide-sm'>{pct(b['chans'])}</td><td>{status_pill(b)}</td>"
                 f"<td class='r'>{res_txt}</td></tr>")
-    log = "".join(logrow(b) for b in sorted(bs, key=lambda b: -b["lagd"]))
-    log_html = ('<div class="scroll"><table><tr><th>Start</th><th>Spelare</th><th class="r">Bud</th><th class="r hide-sm">Boten</th>'
-                '<th>Status</th><th class="r">Resultat</th></tr>' + log + "</table></div>") if bs else '<p class="mut">Inga låtsasbet än. Boten lägger dem ca 3 timmar före start.</p>'
+    log = "".join(logrow(b) for b in sorted(alla, key=lambda b: -b["lagd"]))
+    log_html = ('<p class="mut" style="font-size:13px">Alla låtsasbet, båda strategierna. Resultat inom parentes = vad ett ofyllt bud hade gett.</p><div class="scroll"><table><tr><th>Start</th><th>Spelare</th><th class="r">Bud</th><th class="r hide-sm">Boten</th>'
+                '<th>Status</th><th class="r">Resultat</th></tr>' + log + "</table></div>") if alla else '<p class="mut">Inga låtsasbet än. Boten lägger dem ca 3 timmar före start.</p>'
     ovr = "".join(f"<tr><td>{tid(a['start'])}</td><td>{H.escape(a['title'])}"
                   f"<span class='sub'>{H.escape(a.get('skäl') or a.get('slutsats', ''))}</span></td></tr>"
                   for a in sorted(analyses, key=lambda a: a["start"]) if not a.get("signal"))
@@ -173,6 +177,8 @@ def build(analyses, bs, strat, kassa_fn):
 <h2>Låtsasbet</h2>{log_html}
 <h2>Övriga ATP-matcher</h2><details><summary>{len(analyses) - len(sig)} matcher utan spelvärde (visa varför)</summary>
 <div class="scroll" style="border:0;padding:0;margin-top:8px"><table>{ovr}</table></div></details>
-<footer>Strategin: köpbud när botens chans är minst 10 procentenheter högre än budpriset, ca 3 timmar före start, bara ATP-touren.
-Låtsasinsats 100 kr per bet. Förslaget på riktig insats ({RIKTIG_INSATS_USD} $) är 1 % av 1 000 $ medan strategin testas.
+<footer>Huvudstrategin: köpbud när Pinnacles rättvisa chans är minst {100 * strat["edge_pin"]:.0f} procentenheter högre än budpriset
+och statistikmodellen inte säger emot, ca 3 timmar före start, bara ATP-touren. Den gamla modellstrategin (minst
+{100 * strat["edge"]:.0f} procentenheter mot modellen) låtsasspelas parallellt som jämförelse. Låtsasinsats 100 kr per bet.
+Inga riktiga pengar förrän minst 150 avgjorda låtsasbet visar plus och priset vid start i snitt rört sig åt vårt håll.
 Inget här är en garanti; räkna med långa förlustsviter.</footer></div></body></html>"""
